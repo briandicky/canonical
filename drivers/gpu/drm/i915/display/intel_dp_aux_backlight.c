@@ -141,7 +141,7 @@ static bool intel_dp_aux_set_pwm_freq(struct intel_connector *connector)
 {
 	struct drm_i915_private *dev_priv = to_i915(connector->base.dev);
 	struct intel_dp *intel_dp = intel_attached_dp(connector);
-	const u8 pn = connector->panel.backlight.pwmgen_bit_count;
+	const u8 pn = connector->panel.backlight.edp.vesa.pwmgen_bit_count;
 	int freq, fxp, f, fxp_actual, fxp_min, fxp_max;
 
 	freq = dev_priv->vbt.backlight.pwm_freq_hz;
@@ -181,6 +181,7 @@ static void intel_dp_aux_enable_backlight(const struct intel_crtc_state *crtc_st
 	struct drm_i915_private *i915 = dp_to_i915(intel_dp);
 	struct intel_panel *panel = &connector->panel;
 	u8 dpcd_buf, new_dpcd_buf, edp_backlight_mode;
+	u8 pwmgen_bit_count = panel->backlight.edp.vesa.pwmgen_bit_count;
 
 	if (drm_dp_dpcd_readb(&intel_dp->aux,
 			DP_EDP_BACKLIGHT_MODE_SET_REGISTER, &dpcd_buf) != 1) {
@@ -201,7 +202,7 @@ static void intel_dp_aux_enable_backlight(const struct intel_crtc_state *crtc_st
 
 		if (drm_dp_dpcd_writeb(&intel_dp->aux,
 				       DP_EDP_PWMGEN_BIT_COUNT,
-				       panel->backlight.pwmgen_bit_count) < 0)
+				       pwmgen_bit_count) < 0)
 			drm_dbg_kms(&i915->drm,
 				    "Failed to write aux pwmgen bit count\n");
 
@@ -309,7 +310,7 @@ static u32 intel_dp_aux_calc_max_backlight(struct intel_connector *connector)
 			    "Failed to write aux pwmgen bit count\n");
 		return max_backlight;
 	}
-	panel->backlight.pwmgen_bit_count = pn;
+	panel->backlight.edp.vesa.pwmgen_bit_count = pn;
 
 	max_backlight = (1 << pn) - 1;
 
@@ -351,42 +352,103 @@ intel_dp_aux_display_control_capable(struct intel_connector *connector)
 	return false;
 }
 
+enum intel_dp_aux_backlight_modparam {
+	INTEL_DP_AUX_BACKLIGHT_AUTO = -1,
+	INTEL_DP_AUX_BACKLIGHT_OFF = 0,
+	INTEL_DP_AUX_BACKLIGHT_ON = 1,
+	INTEL_DP_AUX_BACKLIGHT_FORCE_VESA = 2,
+	INTEL_DP_AUX_BACKLIGHT_FORCE_INTEL = 3,
+};
+
 int intel_dp_aux_init_backlight_funcs(struct intel_connector *intel_connector)
 {
 	struct intel_panel *panel = &intel_connector->panel;
 	struct intel_dp *intel_dp = enc_to_intel_dp(intel_connector->encoder);
 	struct drm_i915_private *i915 = dp_to_i915(intel_dp);
+    bool try_intel_interface = false, try_vesa_interface = false;
 	bool force_dpcd;
 
-	force_dpcd = drm_dp_has_quirk(&intel_dp->desc, intel_dp->edid_quirks,
-				      DP_QUIRK_FORCE_DPCD_BACKLIGHT);
-
-	if (i915->params.enable_dpcd_backlight == 0 ||
-	    (!force_dpcd && !intel_dp_aux_display_control_capable(intel_connector)))
-		return -ENODEV;
-
-	/*
-	 * There are a lot of machines that don't advertise the backlight
-	 * control interface to use properly in their VBIOS, :\
+	/* Check the VBT and user's module parameters to figure out which
+	 * interfaces to probe
 	 */
-	if (i915->vbt.backlight.type !=
-	    INTEL_BACKLIGHT_VESA_EDP_AUX_INTERFACE &&
-	    i915->params.enable_dpcd_backlight != 1 && !force_dpcd) {
-		drm_info(&i915->drm,
-			 "Panel advertises DPCD backlight support, but "
-			 "VBT disagrees. If your backlight controls "
-			 "don't work try booting with "
-			 "i915.enable_dpcd_backlight=1. If your machine "
-			 "needs this, please file a _new_ bug report on "
-			 "drm/i915, see " FDO_BUG_URL " for details.\n");
+	switch (i915->params.enable_dpcd_backlight) {
+	case INTEL_DP_AUX_BACKLIGHT_OFF:
 		return -ENODEV;
+	case INTEL_DP_AUX_BACKLIGHT_AUTO:
+		switch (i915->vbt.backlight.type) {
+		case INTEL_BACKLIGHT_VESA_EDP_AUX_INTERFACE:
+			try_vesa_interface = true;
+			break;
+		case INTEL_BACKLIGHT_DISPLAY_DDI:
+			try_intel_interface = true;
+			try_vesa_interface = true;
+			break;
+		default:
+			return -ENODEV;
+		}
+		break;
+	case INTEL_DP_AUX_BACKLIGHT_ON:
+		if (i915->vbt.backlight.type != INTEL_BACKLIGHT_VESA_EDP_AUX_INTERFACE)
+			try_intel_interface = true;
+
+		try_vesa_interface = true;
+		break;
+	case INTEL_DP_AUX_BACKLIGHT_FORCE_VESA:
+		try_vesa_interface = true;
+		break;
+	case INTEL_DP_AUX_BACKLIGHT_FORCE_INTEL:
+		try_intel_interface = true;
+		break;
 	}
 
-	panel->backlight.setup = intel_dp_aux_setup_backlight;
-	panel->backlight.enable = intel_dp_aux_enable_backlight;
-	panel->backlight.disable = intel_dp_aux_disable_backlight;
-	panel->backlight.set = intel_dp_aux_set_backlight;
-	panel->backlight.get = intel_dp_aux_get_backlight;
+	/*
+	 * A lot of eDP panels in the wild will report supporting both the
+	 * Intel proprietary backlight control interface, and the VESA
+	 * backlight control interface. Many of these panels are liars though,
+	 * and will only work with the Intel interface. So, always probe for
+	 * that first.
+	 */
+	if (try_intel_interface && intel_dp_aux_supports_hdr_backlight(connector)) {
+		drm_dbg_kms(dev, "Using Intel proprietary eDP backlight controls\n");
+		panel->backlight.funcs = &intel_dp_hdr_bl_funcs;
+		return 0;
+	}
 
-	return 0;
+	if (try_vesa_interface && intel_dp_aux_supports_vesa_backlight(connector)) {
+		drm_dbg_kms(dev, "Using VESA eDP backlight controls\n");
+		panel->backlight.funcs = &intel_dp_vesa_bl_funcs;
+		return 0;
+	}
+
+	return -ENODEV;
+	//force_dpcd = drm_dp_has_quirk(&intel_dp->desc, intel_dp->edid_quirks,
+	//			      DP_QUIRK_FORCE_DPCD_BACKLIGHT);
+
+	//if (!force_dpcd && !intel_dp_aux_display_control_capable(intel_connector))
+	//	return -ENODEV;
+
+	///*
+	// * There are a lot of machines that don't advertise the backlight
+	// * control interface to use properly in their VBIOS, :\
+	// */
+	//if (i915->vbt.backlight.type !=
+	//    INTEL_BACKLIGHT_VESA_EDP_AUX_INTERFACE &&
+	//    i915->params.enable_dpcd_backlight != 1 && !force_dpcd) {
+	//	drm_info(&i915->drm,
+	//		 "Panel advertises DPCD backlight support, but "
+	//		 "VBT disagrees. If your backlight controls "
+	//		 "don't work try booting with "
+	//		 "i915.enable_dpcd_backlight=1. If your machine "
+	//		 "needs this, please file a _new_ bug report on "
+	//		 "drm/i915, see " FDO_BUG_URL " for details.\n");
+	//	return -ENODEV;
+	//}
+
+	//panel->backlight.setup = intel_dp_aux_setup_backlight;
+	//panel->backlight.enable = intel_dp_aux_enable_backlight;
+	//panel->backlight.disable = intel_dp_aux_disable_backlight;
+	//panel->backlight.set = intel_dp_aux_set_backlight;
+	//panel->backlight.get = intel_dp_aux_get_backlight;
+
+	//return 0;
 }
